@@ -1,116 +1,113 @@
 import 'dotenv/config';
 import express from 'express';
 
-// --- Konstansok ---
 const PORT = process.env.PORT || 3000;
 
 // Raydium AMM v4 program (mainnet)
 const RAYDIUM_AMM = 'RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7';
 
-// Opcionális – ha beállítod a Helius webhook secretet, itt tudsz ellenőrizni.
-// (A Helius "Authentication Header"-be tedd be ugyanazt a titkot, és itt hasonlítsd.)
+// Opcionális auth titok
 const INCOMING_AUTH = process.env.INCOMING_AUTH || null;
 
-// --- App ---
 const app = express();
+app.use(express.json({ limit: '5mb' })); // elég nagy limit a payloadnak
 
-// Helius enhanced webhook JSON-t küld; engedjük a nagyobb body-t is
-app.use(express.json({ limit: '2mb' }));
-
-// Egyszerű auth fejléccel (ha kérsz)
+// Egyszerű auth log + check
 app.use((req, res, next) => {
   if (!INCOMING_AUTH) return next();
   const hdr = req.get('Authorization') || req.get('X-Auth') || '';
-  if (hdr === INCOMING_AUTH) return next();
-  return res.status(401).send('Unauthorized');
+  if (hdr === INCOMING_AUTH) {
+    console.log('[auth] ✅ Authorization OK');
+    return next();
+  } else {
+    console.warn('[auth] ❌ Authorization FAIL', hdr);
+    return res.status(401).send('Unauthorized');
+  }
 });
 
-// Healthcheck
+// Healthcheck endpoint
 app.get('/', (_req, res) => {
+  console.log('[health] GET / called');
   res.send('Raydium LP Burn webhook server ✅');
 });
 
-// Fő webhook endpoint – ide mutasson a Helius (POST)
+// Webhook endpoint
 app.post('/webhook', (req, res) => {
+  console.log('--- [webhook] 🔔 ÚJ REQUEST ÉRKEZETT ---');
+  console.log('[webhook] Headers:', JSON.stringify(req.headers, null, 2));
+
   try {
-    // Helius enhanced: tipikusan TÖMB jön (1..N tx/event)
+    // Az egész body logolása (max 1k karakter, hogy ne öntse el a logot)
+    const rawBody = JSON.stringify(req.body);
+    console.log('[webhook] Raw body (cut to 1000 chars):', rawBody.slice(0, 1000));
+
     const arr = Array.isArray(req.body) ? req.body : [req.body];
+    console.log(`[webhook] Feldolgozandó elemek száma: ${arr.length}`);
 
-    for (const item of arr) {
-      const signature = item?.signature || item?.transactionSignature || 'n/a';
-      const txType = item?.type || item?.transactionType || 'unknown';
+    for (const [i, item] of arr.entries()) {
+      console.log(`\n[tx ${i}] signature=${item?.signature || item?.transactionSignature}`);
+      console.log(`[tx ${i}] type=${item?.type || item?.transactionType}`);
+
       const accounts = item?.accounts || [];
+      console.log(`[tx ${i}] accounts:`, JSON.stringify(accounts));
 
-      // Biztonsági ellenőrzés: Raydium szerepel-e a tranzakció érintett accountjai közt?
-      const mentionsRaydium = accounts.some(a => {
-        // Helius küldhet {account:"<addr>"} vagy plain stringet is
+      // Check: szerepel-e a Raydium AMM
+      const mentionsRaydium = accounts.some((a) => {
         const acc = typeof a === 'string' ? a : a?.account;
         return acc === RAYDIUM_AMM;
       });
+      console.log(`[tx ${i}] mentionsRaydium=${mentionsRaydium}`);
 
-      // Csak Raydium + Burn
-      if (!mentionsRaydium || txType !== 'BURN') continue;
+      if (!mentionsRaydium) {
+        console.log(`[tx ${i}] ❌ Kihagyva, mert nem tartalmazza Raydium programot.`);
+        continue;
+      }
+      if ((item?.type || item?.transactionType) !== 'BURN') {
+        console.log(`[tx ${i}] ❌ Kihagyva, mert nem BURN típus.`);
+        continue;
+      }
 
-      // Próbáljuk kinyerni a burn részleteit az enhanced payloadból.
-      // Helius gyakran ad "instructions" és "innerInstructions" parsed formában:
-      const mints = new Set();
+      // Burn instr. keresése
       const burns = [];
-
-      const scanInstrArray = (arr) => {
-        if (!Array.isArray(arr)) return;
-        for (const ins of arr) {
-          // Formátumok lehetnek: { program:'spl-token', parsed:{ type:'burn', info:{ mint, amount, owner, account } } }
+      const scanInstrArray = (arr2, label) => {
+        if (!Array.isArray(arr2)) return;
+        for (const ins of arr2) {
           const program = ins?.program || ins?.programId || '';
           const parsed = ins?.parsed || {};
           const pType = parsed?.type || '';
           if (program === 'spl-token' && String(pType).toLowerCase() === 'burn') {
-            const info = parsed?.info || {};
-            if (info?.mint) mints.add(info.mint);
-            burns.push({
-              mint: info?.mint || null,
-              amount: info?.amount || null,
-              owner: info?.owner || null,
-              account: info?.account || null
-            });
+            burns.push(parsed?.info || {});
+            console.log(`[tx ${i}] ✅ Burn instruction találtunk in ${label}:`, JSON.stringify(parsed?.info));
           }
         }
       };
 
-      scanInstrArray(item?.instructions);
-      // innerInstructions több szint lehet, kezeljük:
+      scanInstrArray(item?.instructions, 'instructions');
       if (Array.isArray(item?.innerInstructions)) {
         for (const inner of item.innerInstructions) {
-          scanInstrArray(inner?.instructions || inner);
+          scanInstrArray(inner?.instructions || inner, 'innerInstructions');
         }
       }
 
-      // Ha nem találtunk részletes parsed adatot, akkor is logoljuk a minimumot:
       if (burns.length === 0) {
-        console.log(`[RAYDIUM LP BURN] sig=${signature} | (parsed burn részletek nem érkeztek a payloadban)`);
+        console.log(`[tx ${i}] ⚠️ Nem találtunk parsed burn adatot, de Raydium+BURN volt a tx.`);
       } else {
         for (const b of burns) {
-          console.log(
-            `[RAYDIUM LP BURN] sig=${signature} | mint=${b.mint || '-'} | amount=${b.amount || '-'} | owner=${b.owner || '-'}`
-          );
+          console.log(`[tx ${i}] 🔥 RAYDIUM LP BURN | mint=${b.mint} | amount=${b.amount} | owner=${b.owner}`);
         }
-      }
-
-      // Extra: jelezzük, ha több potenciális mint is volt
-      if (mints.size > 1) {
-        console.log(`[info] Több érintett mint ugyanabban a tx-ben: ${[...mints].join(', ')}`);
       }
     }
 
-    // Mindig válaszoljunk gyorsan 200-zal
     res.sendStatus(200);
   } catch (e) {
-    console.error('[webhook error]', e);
-    res.sendStatus(200); // webhookot ne dobjuk vissza hibával, nehogy Helius letiltsa
+    console.error('[webhook] ❌ Feldolgozási hiba:', e);
+    console.error(e.stack);
+    res.sendStatus(200); // Heliusnak mindig 200-at küldünk vissza
   }
 });
 
 // Indítás
 app.listen(PORT, () => {
-  console.log(`HTTP server listening on :${PORT}`);
-  console.log(`Webhook endpoint: POST /webhook`);
+  console.log(`\n[server] 🚀 HTTP server listening on :${PORT}`);
+  console.log(`[server] Webhook endpoint: POST /webhook`);
 });
