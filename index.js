@@ -1,137 +1,96 @@
 import 'dotenv/config';
+import { Connection, PublicKey } from '@solana/web3.js';
 
-// --- ENV ---
-const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
-if (!BITQUERY_API_KEY) {
-  console.error("⚠️ Állítsd be a BITQUERY_API_KEY változót!");
+// --- ENV (állítsd be Renderen is) ---
+const RPC_WSS = process.env.RPC_WSS;     // pl. wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+const RPC_HTTP = process.env.RPC_HTTP;   // pl. https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+if (!RPC_WSS || !RPC_HTTP) {
+  console.error('Állítsd be az RPC_WSS és RPC_HTTP környezeti változókat (Helius kulccsal).');
   process.exit(1);
 }
 
-// Bitquery GraphQL endpoint (HTTP poll)
-const BITQUERY_HTTP_URL =
-  process.env.BITQUERY_HTTP_URL || "https://graphql.bitquery.io";
+// SPL Token program (itt születik a "Instruction: Burn")
+const SPL_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+// Raydium AMM v4 program (ezt akarjuk szűrni)
+const RAYDIUM_AMM = new PublicKey('RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7');
 
-// Raydium program cím (mainnet)
-const RAYDIUM_PROGRAM = "RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7";
+const COMMITMENT = (process.env.COMMITMENT || 'confirmed'); // processed|confirmed|finalized
+const connection = new Connection(RPC_HTTP, COMMITMENT);
 
-// Poll paraméterek
-const POLL_INTERVAL_SEC = Number(process.env.POLL_INTERVAL_SEC || 20);
-const START_MINUTES_AGO = Number(process.env.START_MINUTES_AGO || 2);
-const LIMIT = Number(process.env.PAGE_LIMIT || 25);
+// A web3.js WSS feliratkozás a HTTP URL-t is használja a connection létrehozásakor,
+// de a logs subscription WSS-en megy, ha az RPC szolgáltató támogatja (Helius igen).
+// Itt külön WSS-t adunk meg a low-level log figyeléshez:
+const wsConn = new Connection(RPC_WSS, COMMITMENT);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const isoNowMinus = (mins) =>
-  new Date(Date.now() - mins * 60_000).toISOString();
-
-// --- GraphQL query ---
-const QUERY = /* GraphQL */ `
-  query RaydiumBurns($since: DateTime, $limit: Int!, $program: String!) {
-    Solana {
-      Instructions(
-        where: {
-          Block: { Time: { since: $since } }
-          Instruction: {
-            Program: {
-              Address: { is: $program }
-              Method: { includes: "burn" }
-            }
-          }
-        }
-        orderBy: { ascending: Block_Time }
-        limit: $limit
-      ) {
-        Block { Time }
-        Transaction { Signature }
-        Instruction {
-          Program { Name Address Method }
-          Accounts {
-            Address
-            Token { Mint }
-          }
-        }
-      }
-    }
-  }
-`;
-
-async function gqlFetch(query, variables) {
-  const res = await fetch(BITQUERY_HTTP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-KEY": BITQUERY_API_KEY,
-      Authorization: `Bearer ${BITQUERY_API_KEY}`
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`HTTP ${res.status}: ${txt}`);
-  }
-  const json = await res.json();
-  if (json.errors) throw new Error(JSON.stringify(json.errors));
-  return json.data;
-}
-
-function fmtTs(iso) {
+// Gyors helper: tranzakció betöltése + Raydium szűrés + burn adatok kinyerése
+async function handleTx(signature) {
   try {
-    return new Date(iso).toISOString();
-  } catch {
-    return String(iso);
-  }
-}
+    // Parzolt TX-t kérünk, hogy emberi-olvashatóak legyenek a token műveletek
+    const tx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: COMMITMENT
+    });
+    if (!tx) return;
 
-function summarize(entry) {
-  const sig = entry?.Transaction?.Signature;
-  const time = fmtTs(entry?.Block?.Time);
-  const mints = [
-    ...new Set(
-      (entry?.Instruction?.Accounts || [])
-        .map((a) => a?.Token?.Mint)
-        .filter(Boolean)
-    ),
-  ];
-  return { sig, time, mints };
-}
+    // A Raydium feltétel: a tranzakció accountjai közt szerepel a Raydium program
+    const mentionsRaydium = tx.transaction.message.accountKeys
+      .some(k => k.pubkey?.toBase58() === RAYDIUM_AMM.toBase58());
+    if (!mentionsRaydium) return; // nem Raydium-hoz köthető
 
-async function run() {
-  let since = isoNowMinus(START_MINUTES_AGO);
-  console.log(
-    `[poll] Raydium LP burn watcher indul — since=${since}, interval=${POLL_INTERVAL_SEC}s`
-  );
-
-  for (;;) {
-    try {
-      const data = await gqlFetch(QUERY, {
-        since,
-        limit: LIMIT,
-        program: RAYDIUM_PROGRAM,
-      });
-      const rows = data?.Solana?.Instructions || [];
-
-      if (rows.length > 0) {
-        for (const r of rows) {
-          const { sig, time, mints } = summarize(r);
-          console.log(
-            `[RAYDIUM BURN] ${time} | sig=${sig} | LP mints=${mints.join(",") || "-"}`
-          );
-        }
-        // legutolsó idő tovább léptetése
-        const lastTime = rows[rows.length - 1]?.Block?.Time;
-        if (lastTime) {
-          since = new Date(new Date(lastTime).getTime() + 1).toISOString();
-        }
+    // Keressünk minden parsed "burn" műveletet (SPL Token)
+    const burns = [];
+    const inspectInstr = (i) => {
+      if (i?.program === 'spl-token' && i?.parsed?.type === 'burn') {
+        const info = i.parsed.info || {};
+        burns.push({
+          mint: info.mint,
+          owner: info.owner,
+          amount: info.amount,
+          account: info.account
+        });
       }
-      await sleep(POLL_INTERVAL_SEC * 1000);
-    } catch (e) {
-      console.error("[poll] hiba:", e.message);
-      await sleep(30_000);
+    };
+
+    // fő instrukciók
+    for (const i of tx.transaction.message.instructions || []) {
+      inspectInstr(i);
     }
+    // belső instrukciók
+    for (const inner of tx.meta?.innerInstructions || []) {
+      for (const i of inner.instructions || []) inspectInstr(i);
+    }
+
+    if (burns.length) {
+      const slot = tx.slot;
+      const ts = tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : 'n/a';
+      for (const b of burns) {
+        console.log(
+          `[RAYDIUM LP BURN] ${ts} | slot=${slot} | sig=${signature} | mint=${b.mint} | amount=${b.amount} | owner=${b.owner || '-'}`
+        );
+      }
+    }
+  } catch (e) {
+    console.error('[tx fetch error]', signature, e.message);
   }
 }
 
-run().catch((err) => {
-  console.error("[fatal]", err);
-  process.exit(1);
-});
+(async () => {
+  console.log('[ws] Subscribing to SPL Token program logs (Burn)…');
+  const subId = await wsConn.onLogs(SPL_TOKEN_PROGRAM, async (log) => {
+    try {
+      const { signature, logs } = log;
+      if (!logs?.length) return;
+
+      // Gyors szűrés: csak akkor nézzük a TX-t, ha tényleg Burn történt
+      const hasBurn = logs.some(l => /Instruction:\s*Burn/i.test(l));
+      if (!hasBurn) return;
+
+      // Részletek betöltése és Raydium-szűrés
+      await handleTx(signature);
+    } catch (e) {
+      console.error('[onLogs error]', e.message);
+    }
+  }, COMMITMENT);
+
+  console.log('[ws] Listening. Subscription ID:', subId);
+})();
