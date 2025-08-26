@@ -1,96 +1,116 @@
 import 'dotenv/config';
-import { Connection, PublicKey } from '@solana/web3.js';
+import express from 'express';
 
-// --- ENV (állítsd be Renderen is) ---
-const RPC_WSS = process.env.RPC_WSS;     // pl. wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-const RPC_HTTP = process.env.RPC_HTTP;   // pl. https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-if (!RPC_WSS || !RPC_HTTP) {
-  console.error('Állítsd be az RPC_WSS és RPC_HTTP környezeti változókat (Helius kulccsal).');
-  process.exit(1);
-}
+// --- Konstansok ---
+const PORT = process.env.PORT || 3000;
 
-// SPL Token program (itt születik a "Instruction: Burn")
-const SPL_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-// Raydium AMM v4 program (ezt akarjuk szűrni)
-const RAYDIUM_AMM = new PublicKey('RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7');
+// Raydium AMM v4 program (mainnet)
+const RAYDIUM_AMM = 'RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7';
 
-const COMMITMENT = (process.env.COMMITMENT || 'confirmed'); // processed|confirmed|finalized
-const connection = new Connection(RPC_HTTP, COMMITMENT);
+// Opcionális – ha beállítod a Helius webhook secretet, itt tudsz ellenőrizni.
+// (A Helius "Authentication Header"-be tedd be ugyanazt a titkot, és itt hasonlítsd.)
+const INCOMING_AUTH = process.env.INCOMING_AUTH || null;
 
-// A web3.js WSS feliratkozás a HTTP URL-t is használja a connection létrehozásakor,
-// de a logs subscription WSS-en megy, ha az RPC szolgáltató támogatja (Helius igen).
-// Itt külön WSS-t adunk meg a low-level log figyeléshez:
-const wsConn = new Connection(RPC_WSS, COMMITMENT);
+// --- App ---
+const app = express();
 
-// Gyors helper: tranzakció betöltése + Raydium szűrés + burn adatok kinyerése
-async function handleTx(signature) {
+// Helius enhanced webhook JSON-t küld; engedjük a nagyobb body-t is
+app.use(express.json({ limit: '2mb' }));
+
+// Egyszerű auth fejléccel (ha kérsz)
+app.use((req, res, next) => {
+  if (!INCOMING_AUTH) return next();
+  const hdr = req.get('Authorization') || req.get('X-Auth') || '';
+  if (hdr === INCOMING_AUTH) return next();
+  return res.status(401).send('Unauthorized');
+});
+
+// Healthcheck
+app.get('/', (_req, res) => {
+  res.send('Raydium LP Burn webhook server ✅');
+});
+
+// Fő webhook endpoint – ide mutasson a Helius (POST)
+app.post('/webhook', (req, res) => {
   try {
-    // Parzolt TX-t kérünk, hogy emberi-olvashatóak legyenek a token műveletek
-    const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: COMMITMENT
-    });
-    if (!tx) return;
+    // Helius enhanced: tipikusan TÖMB jön (1..N tx/event)
+    const arr = Array.isArray(req.body) ? req.body : [req.body];
 
-    // A Raydium feltétel: a tranzakció accountjai közt szerepel a Raydium program
-    const mentionsRaydium = tx.transaction.message.accountKeys
-      .some(k => k.pubkey?.toBase58() === RAYDIUM_AMM.toBase58());
-    if (!mentionsRaydium) return; // nem Raydium-hoz köthető
+    for (const item of arr) {
+      const signature = item?.signature || item?.transactionSignature || 'n/a';
+      const txType = item?.type || item?.transactionType || 'unknown';
+      const accounts = item?.accounts || [];
 
-    // Keressünk minden parsed "burn" műveletet (SPL Token)
-    const burns = [];
-    const inspectInstr = (i) => {
-      if (i?.program === 'spl-token' && i?.parsed?.type === 'burn') {
-        const info = i.parsed.info || {};
-        burns.push({
-          mint: info.mint,
-          owner: info.owner,
-          amount: info.amount,
-          account: info.account
-        });
+      // Biztonsági ellenőrzés: Raydium szerepel-e a tranzakció érintett accountjai közt?
+      const mentionsRaydium = accounts.some(a => {
+        // Helius küldhet {account:"<addr>"} vagy plain stringet is
+        const acc = typeof a === 'string' ? a : a?.account;
+        return acc === RAYDIUM_AMM;
+      });
+
+      // Csak Raydium + Burn
+      if (!mentionsRaydium || txType !== 'BURN') continue;
+
+      // Próbáljuk kinyerni a burn részleteit az enhanced payloadból.
+      // Helius gyakran ad "instructions" és "innerInstructions" parsed formában:
+      const mints = new Set();
+      const burns = [];
+
+      const scanInstrArray = (arr) => {
+        if (!Array.isArray(arr)) return;
+        for (const ins of arr) {
+          // Formátumok lehetnek: { program:'spl-token', parsed:{ type:'burn', info:{ mint, amount, owner, account } } }
+          const program = ins?.program || ins?.programId || '';
+          const parsed = ins?.parsed || {};
+          const pType = parsed?.type || '';
+          if (program === 'spl-token' && String(pType).toLowerCase() === 'burn') {
+            const info = parsed?.info || {};
+            if (info?.mint) mints.add(info.mint);
+            burns.push({
+              mint: info?.mint || null,
+              amount: info?.amount || null,
+              owner: info?.owner || null,
+              account: info?.account || null
+            });
+          }
+        }
+      };
+
+      scanInstrArray(item?.instructions);
+      // innerInstructions több szint lehet, kezeljük:
+      if (Array.isArray(item?.innerInstructions)) {
+        for (const inner of item.innerInstructions) {
+          scanInstrArray(inner?.instructions || inner);
+        }
       }
-    };
 
-    // fő instrukciók
-    for (const i of tx.transaction.message.instructions || []) {
-      inspectInstr(i);
-    }
-    // belső instrukciók
-    for (const inner of tx.meta?.innerInstructions || []) {
-      for (const i of inner.instructions || []) inspectInstr(i);
-    }
+      // Ha nem találtunk részletes parsed adatot, akkor is logoljuk a minimumot:
+      if (burns.length === 0) {
+        console.log(`[RAYDIUM LP BURN] sig=${signature} | (parsed burn részletek nem érkeztek a payloadban)`);
+      } else {
+        for (const b of burns) {
+          console.log(
+            `[RAYDIUM LP BURN] sig=${signature} | mint=${b.mint || '-'} | amount=${b.amount || '-'} | owner=${b.owner || '-'}`
+          );
+        }
+      }
 
-    if (burns.length) {
-      const slot = tx.slot;
-      const ts = tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : 'n/a';
-      for (const b of burns) {
-        console.log(
-          `[RAYDIUM LP BURN] ${ts} | slot=${slot} | sig=${signature} | mint=${b.mint} | amount=${b.amount} | owner=${b.owner || '-'}`
-        );
+      // Extra: jelezzük, ha több potenciális mint is volt
+      if (mints.size > 1) {
+        console.log(`[info] Több érintett mint ugyanabban a tx-ben: ${[...mints].join(', ')}`);
       }
     }
+
+    // Mindig válaszoljunk gyorsan 200-zal
+    res.sendStatus(200);
   } catch (e) {
-    console.error('[tx fetch error]', signature, e.message);
+    console.error('[webhook error]', e);
+    res.sendStatus(200); // webhookot ne dobjuk vissza hibával, nehogy Helius letiltsa
   }
-}
+});
 
-(async () => {
-  console.log('[ws] Subscribing to SPL Token program logs (Burn)…');
-  const subId = await wsConn.onLogs(SPL_TOKEN_PROGRAM, async (log) => {
-    try {
-      const { signature, logs } = log;
-      if (!logs?.length) return;
-
-      // Gyors szűrés: csak akkor nézzük a TX-t, ha tényleg Burn történt
-      const hasBurn = logs.some(l => /Instruction:\s*Burn/i.test(l));
-      if (!hasBurn) return;
-
-      // Részletek betöltése és Raydium-szűrés
-      await handleTx(signature);
-    } catch (e) {
-      console.error('[onLogs error]', e.message);
-    }
-  }, COMMITMENT);
-
-  console.log('[ws] Listening. Subscription ID:', subId);
-})();
+// Indítás
+app.listen(PORT, () => {
+  console.log(`HTTP server listening on :${PORT}`);
+  console.log(`Webhook endpoint: POST /webhook`);
+});
