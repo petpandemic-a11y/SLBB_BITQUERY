@@ -6,13 +6,13 @@ const PORT = process.env.PORT || 3000;
 // Raydium AMM v4 program (mainnet)
 const RAYDIUM_AMM = 'RVKd61ztZW9njDq5E7Yh5b2bb4a6JjAwjhH38GZ3oN7';
 
-// Opcionális auth titok
+// Opcionális auth titok (ugyanezt tedd a Helius "Authentication Header"-ébe)
 const INCOMING_AUTH = process.env.INCOMING_AUTH || null;
 
 const app = express();
-app.use(express.json({ limit: '5mb' })); // elég nagy limit a payloadnak
+app.use(express.json({ limit: '5mb' })); // elég nagy a Helius enhanced payloadhoz
 
-// Egyszerű auth log + check
+// Egyszerű auth + log
 app.use((req, res, next) => {
   if (!INCOMING_AUTH) return next();
   const hdr = req.get('Authorization') || req.get('X-Auth') || '';
@@ -25,59 +25,75 @@ app.use((req, res, next) => {
   }
 });
 
-// Healthcheck endpoint
+// Healthcheck
 app.get('/', (_req, res) => {
   console.log('[health] GET / called');
   res.send('Raydium LP Burn webhook server ✅');
 });
 
-// Webhook endpoint
+// Egyszerű futás-idő mérő
+const nowNs = () => Number(process.hrtime.bigint()); // ns
+const nsToMs = (ns) => (ns / 1_000_000).toFixed(3);
+
+// Fő webhook
+let REQ_SEQ = 0; // növekvő request azonosító a logok összefűzéséhez
 app.post('/webhook', (req, res) => {
-  console.log('--- [webhook] 🔔 ÚJ REQUEST ÉRKEZETT ---');
-  console.log('[webhook] Headers:', JSON.stringify(req.headers, null, 2));
+  const reqId = ++REQ_SEQ;
+  const t0 = nowNs();
+
+  console.log(`\n--- [webhook#${reqId}] 🔔 ÚJ REQUEST ÉRKEZETT ---`);
+  console.log(`[webhook#${reqId}] Headers:`, JSON.stringify(req.headers, null, 2));
 
   try {
-    // Az egész body logolása (max 1k karakter, hogy ne öntse el a logot)
-    const rawBody = JSON.stringify(req.body);
-    console.log('[webhook] Raw body (cut to 1000 chars):', rawBody.slice(0, 1000));
+    // Body mint tömb
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    console.log(`[webhook#${reqId}] Raw body (cut 1000 chars): ${JSON.stringify(req.body).slice(0, 1000)}`);
+    console.log(`[webhook#${reqId}] Elemek száma: ${events.length}`);
 
-    const arr = Array.isArray(req.body) ? req.body : [req.body];
-    console.log(`[webhook] Feldolgozandó elemek száma: ${arr.length}`);
+    // Összesítők
+    let passedRaydium = 0;
+    let totalBurnInstructions = 0;
 
-    for (const [i, item] of arr.entries()) {
-      console.log(`\n[tx ${i}] signature=${item?.signature || item?.transactionSignature}`);
-      console.log(`[tx ${i}] type=${item?.type || item?.transactionType}`);
-
+    events.forEach((item, idx) => {
+      const signature = item?.signature || item?.transactionSignature || 'n/a';
+      const txType = item?.type || item?.transactionType || 'unknown';
       const accounts = item?.accounts || [];
-      console.log(`[tx ${i}] accounts:`, JSON.stringify(accounts));
 
-      // Check: szerepel-e a Raydium AMM
+      console.log(`\n[webhook#${reqId} tx${idx}] signature=${signature}`);
+      console.log(`[webhook#${reqId} tx${idx}] type=${txType}`);
+      console.log(`[webhook#${reqId} tx${idx}] accounts: ${JSON.stringify(accounts)}`);
+
+      // Raydium ellenőrzés
       const mentionsRaydium = accounts.some((a) => {
         const acc = typeof a === 'string' ? a : a?.account;
         return acc === RAYDIUM_AMM;
       });
-      console.log(`[tx ${i}] mentionsRaydium=${mentionsRaydium}`);
+      console.log(`[webhook#${reqId} tx${idx}] mentionsRaydium=${mentionsRaydium}`);
 
       if (!mentionsRaydium) {
-        console.log(`[tx ${i}] ❌ Kihagyva, mert nem tartalmazza Raydium programot.`);
-        continue;
+        console.log(`[webhook#${reqId} tx${idx}] ❌ Kihagyva: nem Raydium tx.`);
+        return;
       }
-      if ((item?.type || item?.transactionType) !== 'BURN') {
-        console.log(`[tx ${i}] ❌ Kihagyva, mert nem BURN típus.`);
-        continue;
+      if (txType !== 'BURN') {
+        console.log(`[webhook#${reqId} tx${idx}] ❌ Kihagyva: nem BURN típus.`);
+        return;
       }
 
-      // Burn instr. keresése
+      passedRaydium += 1;
+
+      // Burn instrukciók kigyűjtése (parsed)
       const burns = [];
-      const scanInstrArray = (arr2, label) => {
-        if (!Array.isArray(arr2)) return;
-        for (const ins of arr2) {
+      const scanInstrArray = (arr, label) => {
+        if (!Array.isArray(arr)) return;
+        for (const ins of arr) {
           const program = ins?.program || ins?.programId || '';
           const parsed = ins?.parsed || {};
-          const pType = parsed?.type || '';
-          if (program === 'spl-token' && String(pType).toLowerCase() === 'burn') {
-            burns.push(parsed?.info || {});
-            console.log(`[tx ${i}] ✅ Burn instruction találtunk in ${label}:`, JSON.stringify(parsed?.info));
+          const pType = (parsed?.type || '').toLowerCase();
+          if (program === 'spl-token' && pType === 'burn') {
+            totalBurnInstructions += 1;
+            const info = parsed?.info || {};
+            burns.push(info);
+            console.log(`[webhook#${reqId} tx${idx}] ✅ Burn in ${label}: ${JSON.stringify(info)}`);
           }
         }
       };
@@ -90,19 +106,26 @@ app.post('/webhook', (req, res) => {
       }
 
       if (burns.length === 0) {
-        console.log(`[tx ${i}] ⚠️ Nem találtunk parsed burn adatot, de Raydium+BURN volt a tx.`);
+        console.log(`[webhook#${reqId} tx${idx}] ⚠️ Raydium+BURN tx, de parsed burn részlet nem érkezett.`);
       } else {
         for (const b of burns) {
-          console.log(`[tx ${i}] 🔥 RAYDIUM LP BURN | mint=${b.mint} | amount=${b.amount} | owner=${b.owner}`);
+          console.log(
+            `[webhook#${reqId} tx${idx}] 🔥 RAYDIUM LP BURN | mint=${b.mint || '-'} | amount=${b.amount || '-'} | owner=${b.owner || '-'}`
+          );
         }
       }
-    }
+    });
+
+    const dtMs = nsToMs(nowNs() - t0);
+    console.log(`\n--- [webhook#${reqId}] ✅ KÉSZ | feldolgozott tx-ek: ${events.length} | Raydium-hit: ${passedRaydium} | Burn instrukciók: ${totalBurnInstructions} | idő: ${dtMs} ms ---`);
 
     res.sendStatus(200);
   } catch (e) {
-    console.error('[webhook] ❌ Feldolgozási hiba:', e);
+    const dtMs = nsToMs(nowNs() - t0);
+    console.error(`[webhook#${reqId}] ❌ Hiba feldolgozás közben (${dtMs} ms):`, e);
     console.error(e.stack);
-    res.sendStatus(200); // Heliusnak mindig 200-at küldünk vissza
+    // a webhook válasz maradjon 200, hogy Helius ne tiltsa
+    res.sendStatus(200);
   }
 });
 
