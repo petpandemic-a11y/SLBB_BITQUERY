@@ -1,5 +1,5 @@
 {
-  "name": "raydium-lp-burn-watcher",
+  "name": "raydium-lp-burn-ws",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
@@ -7,6 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.95.0",
     "dotenv": "^16.4.5"
   }
 }
